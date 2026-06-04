@@ -41,3 +41,4 @@ app.listen(PORT, () => {
   console.log(`🚀 SmartPlan server running on port ${PORT}`);
   console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+app.use('/api/ai', require('./src/routes/ai'));
