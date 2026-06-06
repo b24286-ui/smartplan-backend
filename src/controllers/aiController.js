@@ -90,26 +90,21 @@ function occupyWindow(grid, idx, sessionMins) {
 // OLLAMA HELPER (used for reschedule)
 // ═══════════════════════════════════════════════════════════════════════════
 async function askOllama(prompt, numPredict = 80) {
-  const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 120000);
-  try {
-    const res = await fetch('http://localhost:11434/api/generate', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal:  controller.signal,
-      body: JSON.stringify({
-        model:   process.env.OLLAMA_MODEL || 'llama3.2:latest',
-        prompt,
-        stream:  false,
-        options: { temperature: 0.3, num_predict: numPredict },
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Ollama error');
-    return (data.response || '').trim();
-  } finally {
-    clearTimeout(timeout);
-  }
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'openrouter/auto',
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return (data.choices?.[0]?.message?.content || '').trim();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -388,35 +383,15 @@ Now create one ${difficulty} question about ${topicName} (${subjectName}):`
   if (start === -1 || end === -1) throw new Error(`Q${index}: no JSON object found`);
 
   let parsed;
-try {
-  parsed = JSON.parse(clean.slice(start, end + 1));
-} catch {
-  let fixed = clean.slice(start, end + 1)
-    .replace(/,\s*}/g, '}')           // trailing comma before }
-    .replace(/,\s*]/g, ']')           // trailing comma before ]
-    .replace(/}\s*{/g, '},{')         // missing comma between objects
-    .replace(/"answer"/g, '],"answer"') // missing ] before answer key
-    .replace(/]\s*,\s*]/, ']')        // double closing brackets
-    // Remove duplicate closing brackets after options
-    .replace(/("D\.[^"]*")\s*,\s*"answer"/g, '$1],"answer"');
   try {
-    parsed = JSON.parse(fixed);
+    parsed = JSON.parse(clean.slice(start, end + 1));
   } catch {
-    // Last resort: extract fields manually
-    const qMatch   = clean.match(/"question"\s*:\s*"([^"]+)"/);
-    const aMatch   = clean.match(/"answer"\s*:\s*"([A-D])"/);
-    const eMatch   = clean.match(/"explanation"\s*:\s*"([^"]+)"/);
-    const opts     = [...clean.matchAll(/"([A-D]\.[^"]+)"/g)].map(m => m[1]);
-    if (!qMatch || !aMatch || opts.length !== 4) throw new Error('Cannot recover JSON');
-    parsed = {
-      question:    qMatch[1],
-      options:     opts,
-      answer:      aMatch[1],
-      explanation: eMatch ? eMatch[1] : 'See your notes for more details.',
-    };
+    const fixed = clean.slice(start, end + 1)
+      .replace(/,\s*}/g, '}')
+      .replace(/,\s*]/g, ']');
+    parsed = JSON.parse(fixed);
   }
-}
-return parsed;
+  return parsed;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -436,13 +411,12 @@ const generateQuiz = async (req, res) => {
     for (let i = 0; i < count; i++) {
       try {
         const q = await generateSingleQuestion(topicName, subjectName, difficulty, i + 1);
-if (q.question && Array.isArray(q.options) && q.options.length === 4 && q.answer) {
-  if (!q.explanation) q.explanation = "See your notes for more details.";
-  questions.push(q);
-  console.log(`  ✓ Q${i + 1} generated`);
-} else {
-  console.warn(`  ✗ Q${i + 1} invalid shape, skipping`);
-}
+        if (q.question && Array.isArray(q.options) && q.options.length === 4 && q.answer && q.explanation) {
+          questions.push(q);
+          console.log(`  ✓ Q${i + 1} generated`);
+        } else {
+          console.warn(`  ✗ Q${i + 1} invalid shape, skipping`);
+        }
       } catch (qErr) {
         console.warn(`  ✗ Q${i + 1} failed: ${qErr.message}, skipping`);
       }
@@ -461,4 +435,86 @@ if (q.question && Array.isArray(q.options) && q.options.length === 4 && q.answer
   }
 };
 
-module.exports = { generateSchedule, rescheduleSession, generateQuiz };
+  const generatePostSessionQuiz = async (req, res) => {
+    const { subject, topic, studiedText } = req.body;
+
+    if (!subject || !studiedText) {
+      return res.status(400).json({ success: false, message: "subject and studiedText are required" });
+    }
+
+    const questions = [];
+    const errors = [];
+
+    for (let i = 0; i < 4; i++) {
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "openrouter/auto",
+            messages: [
+              {
+                role: "user",
+                content: `You are a JSON API. Output only valid JSON, nothing else.
+
+  Create 1 quiz question based on what a student studied.
+  Subject: ${subject}. Topic: ${topic || "General"}.
+  Student studied: "${studiedText}"
+
+  Output ONLY this JSON with no extra text:
+  {"question":"short question?","options":["A. opt1","B. opt2","C. opt3","D. opt4"],"correctIndex":0,"explanation":"short reason"}`,
+              },
+            ],
+          }),
+        });
+
+        const data = await response.json();
+        if (data.error) throw new Error(data.error.message);
+
+        const raw = data.choices?.[0]?.message?.content || "";
+        const clean = raw.replace(/```json|```/gi, "").trim();
+        const start = clean.indexOf("{");
+        const end = clean.lastIndexOf("}");
+        if (start === -1 || end === -1) throw new Error(`Q${i + 1}: no JSON found`);
+
+        let parsed;
+        try {
+          parsed = JSON.parse(clean.slice(start, end + 1));
+        } catch {
+          const fixed = clean
+            .slice(start, end + 1)
+            .replace(/,\s*}/g, "}")
+            .replace(/,\s*]/g, "]");
+          parsed = JSON.parse(fixed);
+        }
+
+        if (
+          parsed.question &&
+          Array.isArray(parsed.options) &&
+          parsed.options.length === 4 &&
+          parsed.correctIndex !== undefined
+        ) {
+          if (!parsed.explanation) parsed.explanation = "Review your notes for more details.";
+          questions.push(parsed);
+        }
+      } catch (e) {
+        console.warn(`PostSessionQuiz Q${i + 1} failed:`, e.message);
+        errors.push(e.message);
+      }
+    }
+
+    if (questions.length === 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Failed to generate questions",
+        errors,
+      });
+    }
+
+    res.json({ success: true, questions });
+  };
+
+  module.exports = { generateSchedule, rescheduleSession, generateQuiz, generatePostSessionQuiz };
