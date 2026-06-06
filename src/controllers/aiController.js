@@ -1,199 +1,464 @@
-const Subject = require('../models/Subject');
-const Topic   = require('../models/Topic');
+const Subject  = require('../models/Subject');
+const Topic    = require('../models/Topic');
+const Schedule = require('../models/Schedule');
 
-const DAY_NAMES = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+// ═══════════════════════════════════════════════════════════════════════════
+// TIME UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
+const SLOT_MINS = 30;
 
-// Add minutes to "HH:MM" string → "HH:MM"
-function addMins(time, mins) {
-  const [h, m] = time.split(':').map(Number);
-  const total  = h * 60 + m + mins;
-  const hh     = String(Math.floor(total / 60) % 24).padStart(2, '0');
-  const mm     = String(total % 60).padStart(2, '0');
-  return `${hh}:${mm}`;
-}
-
-// "HH:MM" → total minutes from midnight
-function toMins(time) {
-  const [h, m] = time.split(':').map(Number);
+function toMins(t) {
+  const [h, m] = t.split(':').map(Number);
   return h * 60 + m;
 }
+function toTime(m) {
+  return `${String(Math.floor(m / 60)).padStart(2,'0')}:${String(m % 60).padStart(2,'0')}`;
+}
 
-// @desc    Generate AI study schedule
-// @route   POST /api/ai/schedule
-// @access  Private
+// ═══════════════════════════════════════════════════════════════════════════
+// BUILD DAY GRID
+// ═══════════════════════════════════════════════════════════════════════════
+function buildDayGrid(studyStart, studyEnd, lunchTime, lunchDuration, leisureTime, leisureDuration) {
+  const sMin = toMins(studyStart);
+  const eMin = toMins(studyEnd);
+  const lS   = toMins(lunchTime);
+  const lE   = lS + lunchDuration;
+  const rS   = toMins(leisureTime);
+  const rE   = rS + leisureDuration;
+  const grid = [];
+  for (let t = sMin; t < eMin; t += SLOT_MINS) {
+    const blocked = (t >= lS && t < lE) || (t >= rS && t < rE);
+    grid.push({ start: t, end: t + SLOT_MINS, available: !blocked });
+  }
+  return grid;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GREEDY SCORING
+// ═══════════════════════════════════════════════════════════════════════════
+const HARD_KW   = ['dsa','algorithm','algo','math','physic','circuit','verilog',
+                   'calculus','signal','electromagn','statistic','discrete','crypto'];
+const MEDIUM_KW = ['network','database','operating','os','theory','compiler',
+                   'architecture','analog','digital'];
+
+function getCogLoad(name) {
+  const n = name.toLowerCase();
+  if (HARD_KW.some(k   => n.includes(k))) return 3;
+  if (MEDIUM_KW.some(k => n.includes(k))) return 2;
+  return 1;
+}
+function getPriority(name) {
+  const n = name.toLowerCase();
+  if (HARD_KW.some(k   => n.includes(k))) return 5;
+  if (MEDIUM_KW.some(k => n.includes(k))) return 3;
+  return 2;
+}
+function calcScore(name) {
+  return getPriority(name) * getCogLoad(name);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GREEDY INTERVAL PACKER
+// ═══════════════════════════════════════════════════════════════════════════
+function findWindow(grid, sessionMins, preferPeak, peakStart, peakEnd) {
+  const slotsNeeded = Math.ceil(sessionMins / SLOT_MINS);
+  for (const mustBePeak of [true, false]) {
+    for (let i = 0; i <= grid.length - slotsNeeded; i++) {
+      const hour = grid[i].start / 60;
+      if (mustBePeak && preferPeak && !(hour >= peakStart && hour < peakEnd)) continue;
+      const block = grid.slice(i, i + slotsNeeded);
+      if (block.every(s => s.available)) return i;
+    }
+  }
+  return -1;
+}
+
+function occupyWindow(grid, idx, sessionMins) {
+  const slotsNeeded = Math.ceil(sessionMins / SLOT_MINS);
+  const bufferSlots = Math.max(1, Math.ceil(slotsNeeded * 0.2));
+  const totalOccupy = slotsNeeded + bufferSlots;
+  for (let i = idx; i < Math.min(grid.length, idx + totalOccupy); i++) {
+    grid[i].available = false;
+  }
+  return {
+    startTime: toTime(grid[idx].start),
+    endTime:   toTime(grid[idx].start + sessionMins),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OLLAMA HELPER (used for reschedule)
+// ═══════════════════════════════════════════════════════════════════════════
+async function askOllama(prompt, numPredict = 80) {
+  const controller = new AbortController();
+  const timeout    = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch('http://localhost:11434/api/generate', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal:  controller.signal,
+      body: JSON.stringify({
+        model:   process.env.OLLAMA_MODEL || 'llama3.2:latest',
+        prompt,
+        stream:  false,
+        options: { temperature: 0.3, num_predict: numPredict },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Ollama error');
+    return (data.response || '').trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// @route POST /api/ai/schedule
+// ═══════════════════════════════════════════════════════════════════════════
 const generateSchedule = async (req, res) => {
   const {
     startDate,
-    weeks         = 1,
-    selectedDays  = [0,1,2,3,4],
-    // advanced
-    studyStart    = '08:00',
-    studyEnd      = '21:00',
-    lunchTime     = '13:00',
-    lunchDuration = 60,
-    leisureTime   = '18:00',
+    weeks           = 1,
+    selectedDays    = [0,1,2,3,4],
+    studyStart      = '08:00',
+    studyEnd        = '21:00',
+    lunchTime       = '13:00',
+    lunchDuration   = 60,
+    leisureTime     = '18:00',
     leisureDuration = 120,
-    sessionLength = 60,
-    energyPeak    = 'morning',
-    bufferPercent = 20,
+    sessionLength   = 60,
+    energyPeak      = 'morning',
+    bufferPercent   = 20,
   } = req.body;
 
   try {
-    // 1. Fetch subjects
     const subjects = await Subject.find({ userId: req.user.id }).lean();
-    if (!subjects.length) {
-      return res.status(400).json({ success: false, message: 'No subjects found. Please add subjects first.' });
-    }
+    if (!subjects.length)
+      return res.status(400).json({ success: false, message: 'No subjects found. Add subjects first.' });
 
-    // 2. Fetch topics
     const subjectsWithTopics = await Promise.all(
-      subjects.map(async (subj) => {
-        const topics = await Topic.find({
-          $or: [{ subjectId: subj._id }, { subject: subj._id }],
-        }).lean();
-        return { ...subj, topics };
+      subjects.map(async (s) => {
+        const topics = await Topic.find({ $or: [{ subjectId: s._id }, { subject: s._id }] }).lean();
+        return { ...s, topics };
       })
     );
 
-    // 3. Calculate available session slots per day
-    const lunchEnd   = addMins(lunchTime,   lunchDuration);
-    const leisureEnd = addMins(leisureTime, leisureDuration);
-    const breakMins  = 30; // gap between sessions
+    const sorted = [...subjectsWithTopics].sort((a, b) => calcScore(b.name) - calcScore(a.name));
 
-    // Work out peak window label
-    const peakWindows = {
-      morning:   '06:00–12:00',
-      afternoon: '12:00–17:00',
-      evening:   '17:00–22:00',
-    };
-    const peakWindow = peakWindows[energyPeak] || peakWindows.morning;
-
-    // Estimate how many sessions fit per day
-    const dayMins      = toMins(studyEnd) - toMins(studyStart);
-    const blockedMins  = lunchDuration + leisureDuration;
-    const availMins    = dayMins - blockedMins;
-    const slotMins     = sessionLength + breakMins;
-    const rawSlots     = Math.floor(availMins / slotMins);
-    const sessionsPerDay = Math.max(1, Math.floor(rawSlots * (1 - bufferPercent / 100)));
-
-    // 4. Build subjects list for prompt
-    const dayNames     = selectedDays.map((i) => DAY_NAMES[i]);
-    const subjectsList = subjectsWithTopics
-      .map((s) => {
-        const topicsBlock = s.topics.length > 0
-          ? s.topics.map((t) => `    - "${t.name}" (topicId: "${t._id}")`).join('\n')
-          : '    - (no topics — set topicId: null, topicName: null)';
-        return `Subject: "${s.name}" (subjectId: "${s._id}")\nTopics:\n${topicsBlock}`;
-      })
-      .join('\n\n');
-
-    // 5. Build rich prompt
-    const prompt = `You are an expert study planner. Return ONLY a valid JSON array, nothing else.
-
-=== SCHEDULE PARAMETERS ===
-Start date: ${startDate}
-Total weeks: ${weeks}
-Study days: ${dayNames.join(', ')}
-Sessions per day: ${sessionsPerDay} (respecting buffer of ${bufferPercent}%)
-
-=== DAILY TIME CONSTRAINTS ===
-Study window: ${studyStart} to ${studyEnd}
-Session length: ${sessionLength} minutes each
-Break between sessions: ${breakMins} minutes
-Lunch break: ${lunchTime} to ${lunchEnd} — NO sessions during this window
-Leisure/personal time: ${leisureTime} to ${leisureEnd} — NO sessions during this window
-
-=== SCHEDULING INTELLIGENCE ===
-1. ENERGY PEAK: The student's cognitive peak is ${energyPeak} (${peakWindow}).
-   → Schedule the most complex/technical subjects (DSA, algorithms, mathematics, circuits, physics) FIRST during peak hours.
-   → Schedule lighter review subjects (communication, theory, reading) outside peak hours.
-
-2. DEEP WORK BLOCKS: Each session is ${sessionLength} minutes — this is a focused, uninterrupted block.
-   → Never schedule two completely unrelated subjects back-to-back if avoidable (e.g., don't go from physics to communication).
-   → Group related subjects on the same day when possible.
-
-3. BLOCKED WINDOWS: Strictly do NOT place any session between ${lunchTime}–${lunchEnd} (lunch) or ${leisureTime}–${leisureEnd} (leisure).
-   → If a session would overlap a blocked window, skip it and place the next session after the window ends.
-
-4. BUFFER RULE: Only schedule ${sessionsPerDay} sessions per day (${bufferPercent}% of available slots kept empty for overflow/unexpected tasks).
-
-5. TOPIC ROTATION: Rotate evenly through all subjects and their topics across the week.
-
-=== SUBJECTS & TOPICS (use EXACT IDs) ===
-${subjectsList}
-
-=== OUTPUT FORMAT ===
-Each item in the JSON array must have EXACTLY these keys:
-{"date":"YYYY-MM-DD","startTime":"HH:MM","endTime":"HH:MM","subjectId":"exact_id","topicId":"exact_id_or_null","subjectName":"string","topicName":"string_or_null","sessionType":"study"}
-
-RULES:
-- endTime = startTime + ${sessionLength} minutes exactly
-- Session times must respect the study window (${studyStart}–${studyEnd})
-- Session times must skip lunch (${lunchTime}–${lunchEnd}) and leisure (${leisureTime}–${leisureEnd})
-- Use ONLY the exact MongoDB IDs provided above
-- Return ONLY the raw JSON array starting with [ and ending with ]`;
-
-    // 6. Call Groq API
-    console.log(`Generating schedule: ${sessionsPerDay} sessions/day, ${sessionLength}min each, peak=${energyPeak}`);
-
-    const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model:       'llama-3.3-70b-versatile',
-        temperature: 0.1,
-        max_tokens:  8000,
-        messages: [
-          {
-            role:    'system',
-            content: 'You are a precise JSON generator. You output ONLY valid JSON arrays with no markdown, no explanation, no preamble. Every response starts with [ and ends with ].',
-          },
-          { role: 'user', content: prompt },
-        ],
-      }),
-    });
-
-    const aiData = await aiRes.json();
-    if (!aiRes.ok) {
-      console.error('Groq error:', JSON.stringify(aiData));
-      throw new Error(aiData.error?.message || 'Groq API request failed');
+    const pairs = [];
+    for (const subj of sorted) {
+      if (subj.topics.length > 0) {
+        subj.topics.forEach(t => pairs.push({
+          subjectId: String(subj._id), subjectName: subj.name,
+          topicId:   String(t._id),   topicName:   t.name,
+          cogLoad:   getCogLoad(subj.name),
+        }));
+      } else {
+        pairs.push({
+          subjectId: String(subj._id), subjectName: subj.name,
+          topicId:   null,             topicName:   null,
+          cogLoad:   getCogLoad(subj.name),
+        });
+      }
     }
 
-    // 7. Parse response
-    const rawText = aiData.choices?.[0]?.message?.content || '';
-    console.log('Groq response (first 200 chars):', rawText.slice(0, 200));
+    const peakMap      = { morning: [6,12], afternoon: [12,17], evening: [17,22] };
+    const [pS, pE]     = peakMap[energyPeak] || [6,12];
+    const jsTargetDays = selectedDays.map(d => (d + 1) % 7);
+    const base         = new Date(startDate + 'T00:00:00');
+    const sessions     = [];
+    let   pairIdx      = 0;
 
-    const cleaned  = rawText.replace(/```json|```/g, '').trim();
-    const arrStart = cleaned.indexOf('[');
-    let   arrEnd   = cleaned.lastIndexOf(']');
+    for (let w = 0; w < weeks; w++) {
+      for (let d = 0; d < 7; d++) {
+        const date = new Date(base);
+        date.setDate(base.getDate() + w * 7 + d);
+        if (!jsTargetDays.includes(date.getDay())) continue;
 
-    if (arrStart === -1) throw new Error('AI did not return a JSON array');
+        const dateStr     = date.toISOString().split('T')[0];
+        const grid        = buildDayGrid(studyStart, studyEnd, lunchTime, lunchDuration, leisureTime, leisureDuration);
+        const totalSlots  = grid.filter(s => s.available).length;
+        const slotPerSess = Math.ceil(sessionLength / SLOT_MINS);
+        const rawCapacity = Math.floor(totalSlots / (slotPerSess * 1.2));
+        const maxSessions = Math.max(1, Math.floor(rawCapacity * (1 - bufferPercent / 100)));
 
-    // Salvage truncated response
-    if (arrEnd === -1 || arrEnd < arrStart) {
-      console.warn('Response truncated — salvaging complete sessions...');
-      const lastGoodItem = cleaned.lastIndexOf('},');
-      if (lastGoodItem === -1) throw new Error('Response too truncated to use');
-      const salvaged = cleaned.slice(arrStart, lastGoodItem + 1) + ']';
-      arrEnd = salvaged.lastIndexOf(']');
-      const sessions = JSON.parse(salvaged);
-      console.log(`✓ Salvaged ${sessions.length} sessions`);
-      return res.json({ success: true, count: sessions.length, sessions });
+        let placed = 0;
+        while (placed < maxSessions) {
+          const pair       = pairs[pairIdx % pairs.length];
+          const preferPeak = pair.cogLoad >= 2;
+          const winIdx     = findWindow(grid, sessionLength, preferPeak, pS, pE);
+          if (winIdx === -1) break;
+          const { startTime, endTime } = occupyWindow(grid, winIdx, sessionLength);
+          sessions.push({
+            date: dateStr, startTime, endTime,
+            subjectId: pair.subjectId, topicId:     pair.topicId,
+            subjectName: pair.subjectName, topicName: pair.topicName,
+            sessionType: 'study',
+          });
+          pairIdx++;
+          placed++;
+        }
+      }
     }
 
-    const sessions = JSON.parse(cleaned.slice(arrStart, arrEnd + 1));
-    if (!Array.isArray(sessions) || sessions.length === 0) throw new Error('AI returned empty schedule');
-
-    console.log(`✓ Generated ${sessions.length} sessions`);
+    console.log(`✓ Generated ${sessions.length} sessions via CSP engine`);
     res.json({ success: true, count: sessions.length, sessions });
 
   } catch (err) {
     console.error('generateSchedule error:', err.message);
-    res.status(500).json({ success: false, message: err.message || 'Failed to generate schedule' });
+    res.status(500).json({ success: false, message: err.message });
   }
 };
 
-module.exports = { generateSchedule };
+// ═══════════════════════════════════════════════════════════════════════════
+// @route POST /api/ai/reschedule
+// ═══════════════════════════════════════════════════════════════════════════
+const rescheduleSession = async (req, res) => {
+  const {
+    sessionId,
+    energyPeak      = 'morning',
+    studyStart      = '08:00',
+    studyEnd        = '21:00',
+    lunchTime       = '13:00',
+    lunchDuration   = 60,
+    leisureTime     = '18:00',
+    leisureDuration = 120,
+  } = req.body;
+
+  try {
+    const missed = await Schedule.findOne({ _id: sessionId, userId: req.user.id })
+      .populate('subjectId', 'name')
+      .populate('topicId',   'name')
+      .lean();
+    if (!missed)
+      return res.status(404).json({ success: false, message: 'Session not found' });
+
+    const subjectName = missed.subjectId?.name || 'Study';
+    const topicName   = missed.topicId?.name   || null;
+    const duration    = missed.duration || 60;
+    const cogLoad     = getCogLoad(subjectName);
+    const cogLabel    = cogLoad === 3 ? 'High-Intensity' : cogLoad === 2 ? 'Medium-Focus' : 'Light-Review';
+
+    const today    = new Date(); today.setUTCHours(0,0,0,0);
+    const nextWeek = new Date(today); nextWeek.setDate(today.getUTCDate() + 7);
+
+    const upcoming = await Schedule.find({
+      userId: req.user.id,
+      date:   { $gte: today, $lt: nextWeek },
+      status: { $ne: 'completed' },
+      _id:    { $ne: sessionId },
+    })
+      .populate('subjectId', 'name')
+      .sort({ date: 1, startTime: 1 })
+      .lean();
+
+    const byDay = {};
+    upcoming.forEach(s => {
+      const d = new Date(s.date).toISOString().split('T')[0];
+      if (!byDay[d]) byDay[d] = [];
+      byDay[d].push({ startMins: toMins(s.startTime), endMins: toMins(s.endTime), name: s.subjectId?.name || '' });
+    });
+
+    const peakMap  = { morning: [6,12], afternoon: [12,17], evening: [17,22] };
+    const [pS, pE] = peakMap[energyPeak] || [6,12];
+
+    const candidates = [];
+    for (let d = 0; d < 7; d++) {
+      const date             = new Date(today);
+      date.setDate(today.getDate() + d);
+      const dateStr          = date.toISOString().split('T')[0];
+      const dayName          = date.toLocaleDateString('en-US', { weekday: 'long' });
+      const grid             = buildDayGrid(studyStart, studyEnd, lunchTime, lunchDuration, leisureTime, leisureDuration);
+      const existingSessions = byDay[dateStr] || [];
+
+      existingSessions.forEach(s => {
+        grid.forEach(slot => {
+          if (slot.start >= s.startMins && slot.end <= s.endMins) slot.available = false;
+        });
+      });
+
+      const winIdx = findWindow(grid, duration, true, pS, pE);
+      if (winIdx === -1) continue;
+
+      const startMins  = grid[winIdx].start;
+      const isPeak     = (startMins / 60) >= pS && (startMins / 60) < pE;
+      const dayLoad    = existingSessions.length;
+      const totalScore = (isPeak ? 40 : 0) + Math.max(0, 30 - dayLoad * 10) + Math.max(0, 7 - d) * 5;
+      const context    = dayLoad > 0 ? `${dayLoad} other session(s) including ${existingSessions[0].name}` : 'no other sessions';
+
+      candidates.push({
+        date: dateStr, dayName,
+        startTime: toTime(startMins), endTime: toTime(startMins + duration),
+        score: totalScore, isPeak, context, dayLoad, daysFromNow: d,
+      });
+
+      if (candidates.length >= 3) break;
+    }
+
+    if (!candidates.length)
+      return res.status(200).json({ success: true, count: 0, slots: [] });
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    const labels           = ['A','B','C'];
+    const slotDescriptions = candidates.map((c, i) =>
+      `Slot ${labels[i]}: ${c.dayName} ${c.date} at ${c.startTime}-${c.endTime} (${c.isPeak ? 'peak energy window' : 'off-peak'}, ${c.context}, ${c.daysFromNow === 0 ? 'today' : c.daysFromNow + ' days from now'})`
+    ).join('\n');
+
+    const aiPrompt = `A student missed a ${duration}-minute ${cogLabel} session on "${subjectName}${topicName ? ' - ' + topicName : ''}".
+
+Candidate reschedule slots:
+${slotDescriptions}
+
+Which single slot best minimizes cognitive fatigue and preserves study momentum?
+Reply with ONLY the letter (A, B, or C), a dash, then one short sentence explaining why.
+Example: "A - Morning peak hours align with the session's high cognitive demand."`;
+
+    console.log('Asking Ollama to rank slots...');
+    const aiReply      = await askOllama(aiPrompt, 80);
+    console.log('Ollama reply:', aiReply);
+
+    const match        = aiReply.match(/\b([A-C])\b/i);
+    const chosenLetter = match ? match[1].toUpperCase() : 'A';
+    const chosenIdx    = labels.indexOf(chosenLetter);
+    const reason       = aiReply.replace(/^[A-C]\s*[-]\s*/i, '').trim() || 'Best available slot based on energy and schedule.';
+
+    const slots = candidates.map((c, i) => ({
+      date: c.date, startTime: c.startTime, endTime: c.endTime,
+      score: i === chosenIdx ? 100 : c.score,
+      tags: [
+        c.isPeak           ? 'Peak hours' : 'Off-peak',
+        c.daysFromNow <= 1 ? 'Within 24h' : `In ${c.daysFromNow} days`,
+        c.dayLoad === 0    ? 'Light day'  : `${c.dayLoad} sessions`,
+      ],
+      reason: i === chosenIdx ? reason : `${c.dayName} ${c.startTime} - available slot`,
+    }));
+
+    if (chosenIdx > 0) {
+      const chosen = slots.splice(chosenIdx, 1)[0];
+      slots.unshift(chosen);
+    }
+
+    console.log(`✓ Reschedule: AI chose slot ${chosenLetter}`);
+    res.json({ success: true, count: slots.length, slots });
+
+  } catch (err) {
+    console.error('rescheduleSession error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPENROUTER QUIZ HELPER — one question at a time
+// ═══════════════════════════════════════════════════════════════════════════
+async function generateSingleQuestion(topicName, subjectName, difficulty, index) {
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'openrouter/free',
+      messages: [
+        {
+          role: 'user',
+          content: `Output only this JSON object, no other text:
+{"question":"Q?","options":["A. opt","B. opt","C. opt","D. opt"],"answer":"A","explanation":"reason"}
+
+Rules:
+- exactly 4 options starting with A. B. C. D.
+- answer is one of: A, B, C, or D
+- no markdown, no extra keys, no repeated keys
+
+Now create one ${difficulty} question about ${topicName} (${subjectName}):`
+        }
+      ],
+    }),
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(`API error: ${data.error.message}`);
+
+  const raw   = data.choices?.[0]?.message?.content || '';
+  console.log(`Q${index} raw:`, raw);
+  const clean = raw.replace(/```json|```/gi, '').trim();
+  const start = clean.indexOf('{');
+  const end   = clean.lastIndexOf('}');
+  if (start === -1 || end === -1) throw new Error(`Q${index}: no JSON object found`);
+
+  let parsed;
+try {
+  parsed = JSON.parse(clean.slice(start, end + 1));
+} catch {
+  let fixed = clean.slice(start, end + 1)
+    .replace(/,\s*}/g, '}')           // trailing comma before }
+    .replace(/,\s*]/g, ']')           // trailing comma before ]
+    .replace(/}\s*{/g, '},{')         // missing comma between objects
+    .replace(/"answer"/g, '],"answer"') // missing ] before answer key
+    .replace(/]\s*,\s*]/, ']')        // double closing brackets
+    // Remove duplicate closing brackets after options
+    .replace(/("D\.[^"]*")\s*,\s*"answer"/g, '$1],"answer"');
+  try {
+    parsed = JSON.parse(fixed);
+  } catch {
+    // Last resort: extract fields manually
+    const qMatch   = clean.match(/"question"\s*:\s*"([^"]+)"/);
+    const aMatch   = clean.match(/"answer"\s*:\s*"([A-D])"/);
+    const eMatch   = clean.match(/"explanation"\s*:\s*"([^"]+)"/);
+    const opts     = [...clean.matchAll(/"([A-D]\.[^"]+)"/g)].map(m => m[1]);
+    if (!qMatch || !aMatch || opts.length !== 4) throw new Error('Cannot recover JSON');
+    parsed = {
+      question:    qMatch[1],
+      options:     opts,
+      answer:      aMatch[1],
+      explanation: eMatch ? eMatch[1] : 'See your notes for more details.',
+    };
+  }
+}
+return parsed;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// @route POST /api/ai/quiz
+// ═══════════════════════════════════════════════════════════════════════════
+const generateQuiz = async (req, res) => {
+  try {
+    const { subjectName, topicName, difficulty = 'medium', count = 5 } = req.body;
+
+    if (!subjectName || !topicName) {
+      return res.status(400).json({ success: false, message: 'subjectName and topicName are required' });
+    }
+
+    console.log(`Generating quiz: ${count} ${difficulty} questions on "${topicName}"...`);
+
+    const questions = [];
+    for (let i = 0; i < count; i++) {
+      try {
+        const q = await generateSingleQuestion(topicName, subjectName, difficulty, i + 1);
+if (q.question && Array.isArray(q.options) && q.options.length === 4 && q.answer) {
+  if (!q.explanation) q.explanation = "See your notes for more details.";
+  questions.push(q);
+  console.log(`  ✓ Q${i + 1} generated`);
+} else {
+  console.warn(`  ✗ Q${i + 1} invalid shape, skipping`);
+}
+      } catch (qErr) {
+        console.warn(`  ✗ Q${i + 1} failed: ${qErr.message}, skipping`);
+      }
+    }
+
+    if (questions.length === 0) {
+      return res.status(500).json({ success: false, message: 'Failed to generate any questions. Try again.' });
+    }
+
+    console.log(`✓ Quiz generated: ${questions.length}/${count} questions`);
+    res.json({ success: true, questions });
+
+  } catch (err) {
+    console.error('generateQuiz error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to generate quiz', error: err.message });
+  }
+};
+
+module.exports = { generateSchedule, rescheduleSession, generateQuiz };

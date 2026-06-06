@@ -35,9 +35,8 @@ const getTopic = async (req, res) => {
 // @route   POST /api/topics
 // @access  Private
 const createTopic = async (req, res) => {
-  const { subjectId, name, difficulty, estimatedTime, notes } = req.body;
+  const { subjectId, name, difficulty, estimatedTime, notes, status } = req.body;  // ← add status
   try {
-    // Verify subject belongs to user
     const subject = await Subject.findOne({ _id: subjectId, userId: req.user.id });
     if (!subject) {
       return res.status(404).json({ success: false, message: 'Subject not found' });
@@ -47,19 +46,20 @@ const createTopic = async (req, res) => {
 
     const topic = await Topic.create({
       subjectId,
-      userId: req.user.id,
+      userId:        req.user.id,
       name,
-      difficulty: difficulty || 'medium',
-      estimatedTime: estimatedTime || 60,
-      notes: notes || '',
-      order: topicCount
+      difficulty:    difficulty    || 'Medium',
+      estimatedTime: estimatedTime || 1,
+      status:        status        || 'not-started',   // ← add this
+      notes:         notes         || '',
+      order:         topicCount,
     });
 
-    // Sync subject total topics count
     await Subject.findByIdAndUpdate(subjectId, { $inc: { totalTopics: 1 } });
 
     res.status(201).json({ success: true, topic });
   } catch (error) {
+     console.error("createTopic ERROR:", error); 
     res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };

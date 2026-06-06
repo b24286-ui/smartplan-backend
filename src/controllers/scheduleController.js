@@ -76,11 +76,12 @@ const createScheduleItem = async (req, res) => {
 // @route   PUT /api/schedule/:id
 // @access  Private
 // ─────────────────────────────────────────────────────────────────────────────
+// In smartplan-backend/src/controllers/scheduleController.js
+// Find the updateScheduleItem function and add date to the whitelist:
+
 const updateScheduleItem = async (req, res) => {
   try {
-    // Whitelist fields — never pass raw req.body into findOneAndUpdate
-    // to avoid accidentally overwriting userId, subjectId, etc.
-    const { status, startTime, endTime, sessionId, type } = req.body;
+    const { status, startTime, endTime, sessionId, type, date } = req.body;
     const updates = {};
 
     if (status    !== undefined) updates.status    = status;
@@ -88,8 +89,8 @@ const updateScheduleItem = async (req, res) => {
     if (endTime   !== undefined) updates.endTime   = endTime;
     if (sessionId !== undefined) updates.sessionId = sessionId;
     if (type      !== undefined) updates.type      = type;
+    if (date      !== undefined) updates.date      = new Date(date); // ← ADD THIS LINE
 
-    // Recalculate duration whenever times change
     const s = startTime || undefined;
     const e = endTime   || undefined;
     if (s && e) updates.duration = calcDuration(s, e);
@@ -102,15 +103,13 @@ const updateScheduleItem = async (req, res) => {
       .populate('subjectId', 'name color icon colorIdx')
       .populate('topicId',   'name status');
 
-    if (!scheduleItem) {
+    if (!scheduleItem)
       return res.status(404).json({ success: false, message: 'Schedule item not found' });
-    }
     res.json({ success: true, scheduleItem });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };
-
 // ─────────────────────────────────────────────────────────────────────────────
 // @desc    Delete schedule item
 // @route   DELETE /api/schedule/:id
